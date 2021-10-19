@@ -2,29 +2,27 @@
 import datetime
 import logging
 import re
+import hashlib
+import os
 
-from sqlalchemy import create_engine, func
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import func
+from database.tabledef import db_User, Order, Meal
+from database import db_util
 from telegram import *
 from telegram.ext import *
 
 import config
 import paginator
-from database.tabledef import db_User, Order, Meal
 import localizations.en as loc_en  # Import english localization
 import localizations.ru as loc_ru  # Import russian localization
 
-# initialize database engine, sessionmaker
-engine = create_engine(config.DATABASE, echo=False)
-Session = sessionmaker(bind=engine)
-local_session = Session()
 
 # logging is not widely used here, but i snatched this anyway.
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 bot = Bot(config.TELEGRAM_TOKEN)
 datetime = datetime.datetime
 
-# default value for language just so that pycharm doesn't freak out
+# default value for language
 lang = loc_en
 
 # initialize updater, dispatcher, setup conversation states
@@ -44,6 +42,19 @@ def split_overlap(array, size, overlap):
         else:
             result.append(array[:size])
             array = array[size - overlap:]
+
+def gen_hash_pass(password: str, s_length: int, k_length: int, i_amount: int):
+    s_length = int(s_length)
+    salt = os.urandom(s_length)
+    print(type(config.SALT_LENGTH))
+    key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, i_amount, k_length)
+    return salt+key
+
+def check_hash_pass(password: str, comp_key_param, s_length: int, k_length: int, i_amount: int):
+    c_salt = comp_key_param[:s_length]
+    c_key = comp_key_param[s_length:]
+    key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), c_salt, i_amount, k_length)
+    return key == c_key
 
 
 # what happens after '/start'
@@ -67,21 +78,25 @@ def language_chosen(update: Update, context: CallbackContext):
         lang = loc_ru
 
     context.bot.send_message(chat_id=update.effective_chat.id, text=lang.GREETING)
+    local_session = db_util.Session()
     if local_session.query(db_User).filter(db_User.id == update.effective_chat.id).all():
         # if user is in database skip to choosing contact phone
         if local_session.query(db_User).filter(db_User.id == update.effective_chat.id).first().is_chef:
             # if user is chef ask which mode to proceed in
             r_keyboard = [[lang.CHEF0, lang.CHEF1]]
             update.message.reply_text(lang.CHEF, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+            local_session.close()
             return CHEF_CHECK
         r_keyboard = [[lang.CONTACT0, KeyboardButton(lang.CONTACT1, request_contact=True)], [lang.STOP]]
-        update.message.reply_text(lang.CONTACT, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True), )
+        update.message.reply_text(lang.CONTACT, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+        local_session.close()
         return CONTACT_CHOICE
     else:
         # if user is not in db proceed to registration
         bot.send_message(chat_id=update.effective_chat.id, text=lang.REG)
         r_keyboard = [[KeyboardButton(lang.REG_START, request_contact=True)]]
         update.message.reply_text(lang.REG0, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+        local_session.close()
         return REGISTER
 
 
@@ -93,19 +108,23 @@ def registration(update: Update, context: CallbackContext):
 
 
 # happens after getting correct registration format
-def registration_success(update: Update, context: CallbackContext):
+def registration_correct(update: Update, context: CallbackContext):
+    local_session = db_util.Session()
     context.user_data['tmp'] = update.message.text
     i_name = re.search('[^\s]+(?=[ ])', context.user_data['tmp']).group()  # regex search for name
     i_pass = re.search('(?<=[ ])[^\s]+(?=$)', context.user_data['tmp']).group()  # regex search for password
     if len(i_name) > 32:
         # length requirement check for name
         bot.send_message(chat_id=update.effective_chat.id, text=lang.LONG_NAME)
+        local_session.close()
         return REGISTER_FINAL
     if len(i_pass) > 32:
         # length requirement check for password
         bot.send_message(chat_id=update.effective_chat.id, text=lang.LONG_PASS)
+        local_session.close()
         return REGISTER_FINAL
-    # if both length check are passed add user to the database
+    # if both length check are passed add user to the database, hash password
+    i_pass = gen_hash_pass(i_pass, config.SALT_LENGTH, config.KEY_LENGTH, config.ITERATION_COUNT)
     local_session.add(db_User(
         id=update.effective_chat.id, phone_number=context.user_data['phone'],
         name=i_name, is_chef=False, password=i_pass, reg_date=func.now())
@@ -114,11 +133,12 @@ def registration_success(update: Update, context: CallbackContext):
     # ask for contact phone number input method
     r_keyboard = [[lang.CONTACT0, KeyboardButton(lang.CONTACT1, request_contact=True)], [lang.STOP]]
     update.message.reply_text(lang.CONTACT, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+    local_session.close()
     return CONTACT_CHOICE
 
 
 # happens after getting incorrect registration format
-def registration_fail(update: Update, context: CallbackContext):
+def registration_incorrect(update: Update, context: CallbackContext):
     bot.send_message(chat_id=update.effective_chat.id, text=lang.UNRECOGNIZED_FORMAT+'\n'+lang.REG)
     return REGISTER_FINAL
 
@@ -131,30 +151,34 @@ def contact_type(update: Update, context: CallbackContext):
 
 # happens after getting correctly formatted contact phone number from user
 def contact_type_finish(update: Update, context: CallbackContext):
+    local_session = db_util.Session()
     context.user_data['contact_phone'] = re.sub('\+', '', str(update.message.text))
     if local_session.query(db_User).filter(db_User.phone_number == context.user_data['contact_phone']).all():
         # if that phone number is in db, ask for password
         r_keyboard = [[lang.PASSWORD_RETURN]]
         update.message.reply_text(lang.PASSWORD, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+        local_session.close()
         return PASSWORD_CHECK
     else:
         # if no such number is in db, ask for contact phone number input method
         bot.send_message(chat_id=update.effective_chat.id, text=lang.PASSWORD0)
         r_keyboard = [[lang.CONTACT0, KeyboardButton(lang.CONTACT1, request_contact=True)], [lang.STOP]]
-        update.message.reply_text(lang.CONTACT, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True), )
+        update.message.reply_text(lang.CONTACT, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+        local_session.close()
         return CONTACT_CHOICE
 
 
 # happens after user chooses to share his own contact
 def contact_shared(update: Update, context: CallbackContext):
+    local_session = db_util.Session()
     context.user_data['contact_phone'] = re.sub('\+', '', str(update.message.contact.phone_number))
-
     if local_session.query(db_User).filter(db_User.phone_number == context.user_data['contact_phone']).all() \
             and update.effective_chat.id == local_session.query(db_User)\
             .filter(db_User.phone_number == context.user_data['contact_phone']).first().id:
         # if that phone number is in db, ask for password
         r_keyboard = [[lang.PASSWORD_RETURN]]
         update.message.reply_text(lang.PASSWORD, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+        local_session.close()
         return PASSWORD_CHECK
     else:
         # if no such number is in db, ask for contact phone number input method
@@ -164,34 +188,41 @@ def contact_shared(update: Update, context: CallbackContext):
         bot.send_message(chat_id=update.effective_chat.id, text=lang.PASSWORD0)
         r_keyboard = [[lang.CONTACT0, KeyboardButton(lang.CONTACT1, request_contact=True)], [lang.STOP]]
         update.message.reply_text(lang.CONTACT, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+        local_session.close()
         return CONTACT_CHOICE
 
 
-# happens after getting password esq. line from user when in PASSWORD_CHECK
+# happens after getting password esque line from user when in PASSWORD_CHECK
 def check_password(update: Update, context: CallbackContext):
+    local_session = db_util.Session()
     if update.message.text == lang.PASSWORD_RETURN:
         # Return to selecting contact phone number.
         r_keyboard = [[lang.CONTACT0, KeyboardButton(lang.CONTACT1, request_contact=True)], [lang.STOP]]
         update.message.reply_text(lang.CONTACT, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+        local_session.close()
         return CONTACT_CHOICE
     if len(update.message.text) > 32:
         # Length check
         bot.send_message(chat_id=update.effective_chat.id, text=lang.LONG_PASS)
         r_keyboard = [[lang.PASSWORD_RETURN]]
         update.message.reply_text(lang.PASSWORD, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+        local_session.close()
         return PASSWORD_CHECK
     # get user with that contact phone number from database
     context.user_data['tmp'] = local_session.query(db_User).\
         filter(db_User.phone_number == context.user_data['contact_phone']).first()
-    if context.user_data['tmp'].password == update.message.text:
+    if check_hash_pass(update.message.text, context.user_data['tmp'].password,
+                       config.SALT_LENGTH, config.KEY_LENGTH, config.ITERATION_COUNT):
         # if their password is the one user entered, open main menu
         r_keyboard = [[lang.MAIN0, lang.MAIN1], [lang.MAIN2]]
         update.message.reply_text(lang.MAIN, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+        local_session.close()
         return MAIN
     else:
         bot.send_message(chat_id=update.effective_chat.id, text=lang.PASSWORD1)
         r_keyboard = [[lang.PASSWORD_RETURN]]
         update.message.reply_text(lang.PASSWORD, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+        local_session.close()
         return PASSWORD_CHECK
 
 
@@ -212,44 +243,53 @@ def chef(update: Update, context: CallbackContext):
         return CONTACT_CHOICE
 
 
-# happens after getting password-esq. message from user when in CHEF_PASS_CHECK state
+# happens after getting password-esque message from user when in CHEF_PASS_CHECK state
 def chef_check_password(update: Update, context: CallbackContext):
+    local_session = db_util.Session()
     if update.message.text == lang.CHEF01:
         # if user changes mind and decides to proceed as client
         r_keyboard = [[lang.CONTACT0, KeyboardButton(lang.CONTACT1, request_contact=True)], [lang.STOP]]
         update.message.reply_text(lang.CONTACT, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+        local_session.close()
         return CONTACT_CHOICE
     if len(update.message.text) > 32:
         # length check
         bot.send_message(chat_id=update.effective_chat.id, text=lang.LONG_PASS)
         r_keyboard = [[lang.PASSWORD_RETURN]]
         update.message.reply_text(lang.PASSWORD, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+        local_session.close()
         return CHEF_PASS_CHECK
     context.user_data['tmp'] = local_session.query(db_User).filter(db_User.id == update.effective_chat.id).first()
-    if context.user_data['tmp'].password == update.message.text:
+    if check_hash_pass(update.message.text, context.user_data['tmp'].password,
+                       config.SALT_LENGTH, config.KEY_LENGTH, config.ITERATION_COUNT):
         # if the entered password is correct proceed to chef's menu
         r_keyboard = [[lang.CHEF_MAIN0, lang.CHEF_MAIN1], [lang.CHEF_MAIN2]]
         update.message.reply_text(lang.CHEF_MAIN, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+        local_session.close()
         return CHEF_MAIN
     else:
         # if the password is wrong
         bot.send_message(chat_id=update.effective_chat.id, text=lang.PASSWORD1)
         r_keyboard = [[lang.PASSWORD_RETURN]]
         update.message.reply_text(lang.PASSWORD, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+        local_session.close()
         return CHEF_PASS_CHECK
 
 
 # function to make a description for order from database
 def textify_order(order_id):
+    local_session = db_util.Session()
     i = local_session.query(Order).filter(Order.id == order_id).first()
     reply_text = lang.CHEF_ORDER_LIST_CONTENT.format(id=i.id, user_id=i.user_id,
                                                      phone=i.contact_phone_number, content=i.content,
                                                      date=i.ins_date, status=i.status)
+    local_session.close()
     return reply_text
 
 
 # happens after chef presses get orders button
 def chef_list_orders(update: Update, context: CallbackContext):
+    local_session = db_util.Session()
     db_q_p_orders = local_session.query(Order).filter(Order.status == "pending")
     if db_q_p_orders.all():
         # if there are pending orders in db, send them using pages from paginator
@@ -265,15 +305,17 @@ def chef_list_orders(update: Update, context: CallbackContext):
                        photo=open(str(db_q_p_orders.first().meal.img), 'rb'),
                        caption=textify_order(db_q_p_orders.first().id), reply_markup=r_pag.markup)
     else:
-        # else notify chef there are no orders and return to main menu
+        # else notify chef there are no orders
         bot.send_message(chat_id=update.effective_chat.id, text=lang.CHEF_MAIN00)
-        r_keyboard = [[lang.CHEF_MAIN0, lang.CHEF_MAIN1], [lang.CHEF_MAIN2]]
-        update.message.reply_text(lang.CHEF_MAIN, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
-        return CHEF_MAIN
+    r_keyboard = [[lang.CHEF_MAIN0, lang.CHEF_MAIN1], [lang.CHEF_MAIN2]]
+    update.message.reply_text(lang.CHEF_MAIN, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+    local_session.close()
+    return CHEF_MAIN
 
 
 # happens after chef presses get accepted orders button
 def chef_list_accepted_orders(update: Update, context: CallbackContext):
+    local_session = db_util.Session()
     db_q_a_orders = local_session.query(Order).filter(Order.status == "accepted")
     if db_q_a_orders.all():
         # if there are accepted orders in db, send them using pages from paginator
@@ -293,9 +335,10 @@ def chef_list_accepted_orders(update: Update, context: CallbackContext):
     else:
         # else notify chef there are no orders and return to main menu
         bot.send_message(chat_id=update.effective_chat.id, text=lang.CHEF_MAIN00)
-        r_keyboard = [[lang.CHEF_MAIN0, lang.CHEF_MAIN1], [lang.CHEF_MAIN2]]
-        update.message.reply_text(lang.CHEF_MAIN, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
-        return CHEF_MAIN
+    r_keyboard = [[lang.CHEF_MAIN0, lang.CHEF_MAIN1], [lang.CHEF_MAIN2]]
+    update.message.reply_text(lang.CHEF_MAIN, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+    local_session.close()
+    return CHEF_MAIN
 
 
 # happens after chef presses edit menu button
@@ -318,10 +361,12 @@ def chef_add_meal(update: Update, context: CallbackContext):
 
 # happens after getting correct input from chef to add a meal
 def chef_add_meal_process(update: Update, context: CallbackContext):
+    local_session = db_util.Session()
     if update.message.text == lang.CHEF_MAIN211:
         r_keyboard = [[lang.CHEF_MAIN21, lang.CHEF_MAIN22], [lang.CHEF_MAIN23]]
         r_markup = ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True)
         update.message.reply_text(lang.CHEF_MAIN20, reply_markup=r_markup)
+        local_session.close()
         return CHEF_EDIT_MENU
     context.user_data['tmp'] = update.message.text
     if update.message.photo:
@@ -343,15 +388,16 @@ def chef_add_meal_process(update: Update, context: CallbackContext):
         new_File.download(img)
         local_session.add(Meal(img=img, name=context.user_data['nm_name'], cost=float(context.user_data['nm_cost'])))
         local_session.commit()
-
         r_keyboard = [[lang.CHEF_MAIN21, lang.CHEF_MAIN22], [lang.CHEF_MAIN23]]
         r_markup = ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True)
         update.message.reply_text(lang.CHEF_MAIN20, reply_markup=r_markup)
+        local_session.close()
         return CHEF_EDIT_MENU
 
 
 # happens after chef presses view meals button
 def chef_view_meals(update: Update, context: CallbackContext):
+    local_session = db_util.Session()
     db_q_meal_types = local_session.query(Meal)
     if db_q_meal_types.all():
         # if there are meals in db, send them using pages from paginator
@@ -373,6 +419,7 @@ def chef_view_meals(update: Update, context: CallbackContext):
     r_keyboard = [[lang.CHEF_MAIN21, lang.CHEF_MAIN22], [lang.CHEF_MAIN23]]
     r_markup = ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True)
     update.message.reply_text(lang.CHEF_MAIN20, reply_markup=r_markup)
+    local_session.close()
     return CHEF_EDIT_MENU
 
 
@@ -385,6 +432,7 @@ def chef_return_to_main(update: Update, context: CallbackContext):
 
 # happens after client asks for (meal) menu
 def menu(update: Update, context: CallbackContext):
+    local_session = db_util.Session()
     db_q_meal_types = local_session.query(Meal)
     if db_q_meal_types.all():
         # if there are meals in db, send them using pages from paginator
@@ -406,6 +454,7 @@ def menu(update: Update, context: CallbackContext):
     # return to main menu
     r_keyboard = [[lang.MAIN0, lang.MAIN1], [lang.MAIN2]]
     update.message.reply_text(lang.MAIN, reply_markup=ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True))
+    local_session.close()
     return MAIN
 
 
@@ -445,6 +494,7 @@ def def_cart(update: Update, context: CallbackContext):
 
 # happens after user presses order status button
 def order_status(update: Update, context: CallbackContext):
+    local_session = db_util.Session()
     db_q_u_orders = local_session.query(Order).filter(Order.user_id == update.effective_chat.id)
     if db_q_u_orders.all():
         # if there are orders of that user in db, send info about them in pages
@@ -459,6 +509,7 @@ def order_status(update: Update, context: CallbackContext):
         bot.send_message(chat_id=update.effective_chat.id, text=lang.MAIN20)
     reply_keyboard = [[lang.MAIN0, lang.MAIN1], [lang.MAIN2]]
     update.message.reply_text(lang.MAIN, reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True))
+    local_session.close()
     return MAIN
 
 
@@ -467,6 +518,7 @@ def button(update: Update, context: CallbackContext) -> None:
     query = update.callback_query
     query.answer()
     q_data = query.data
+    local_session = db_util.Session()
 
     if q_data.find("cart#") != -1:
         # if pressed button callback data begins with <cart#>, take substring of q_data after "#"
@@ -650,10 +702,12 @@ def button(update: Update, context: CallbackContext) -> None:
         orders_log.close()
         local_session.delete(db_q_id.first())
         local_session.commit()
+    local_session.close()
 
 
 # handle precheckout callback
 def precheckout_callback(update: Update, context: CallbackContext) -> None:
+    local_session = db_util.Session()
     q_invoice = update.pre_checkout_query
     context.user_data['last_q_invoice'] = q_invoice
     if q_invoice.invoice_payload.find("cart_confirm_payload#") != -1 \
@@ -671,10 +725,12 @@ def precheckout_callback(update: Update, context: CallbackContext) -> None:
                              text=lang.CART_TMO.format(n_ord_db=n_ord_db, n_av_db=config.MAX_ORDERS - n_ord_db))
             context.user_data['cart'].clear()
             q_invoice.answer(ok=False, error_message="Too many orders.")
+    local_session.close()
 
 
 # happens after successful payment
 def successful_payment_callback(update: Update, context: CallbackContext) -> None:
+    local_session = db_util.Session()
     update.message.reply_text(lang.PAYMENT_TY)
     q_invoice = context.user_data['last_q_invoice']
     if q_invoice.invoice_payload.find("cart_confirm_payload#") != -1 \
@@ -690,12 +746,13 @@ def successful_payment_callback(update: Update, context: CallbackContext) -> Non
         local_session.commit()
         bot.send_message(chat_id=payload_id, text=lang.CART10)
         context.user_data['cart'].clear()
+    local_session.close()
 
 
 # haven't quite figured out how to restart bot, ignore this please
 def stop_bot(update: Update, context: CallbackContext):
     reply_keyboard = [[lang.CONTACT0, KeyboardButton(lang.CONTACT1, request_contact=True)], [lang.STOP]]
-    update.message.reply_text(lang.CONTACT, reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True), )
+    update.message.reply_text(lang.CONTACT, reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True))
     return CONTACT_CHOICE
 
 
@@ -709,8 +766,8 @@ def main():
         states={
             LANG_CHOICE: [MessageHandler(Filters.regex('^(🇬🇧English|🇷🇺Русский)$'), language_chosen)],
             REGISTER: [MessageHandler(Filters.contact, registration)],
-            REGISTER_FINAL: [MessageHandler(Filters.regex('[^\s]+ [^\s]+(?=$)'), registration_success),
-                             MessageHandler(~Filters.regex('[^\s]+ [^\s]+(?=$)'), registration_fail)],
+            REGISTER_FINAL: [MessageHandler(Filters.regex('[^\s]+ [^\s]+(?=$)'), registration_correct),
+                             MessageHandler(~Filters.regex('[^\s]+ [^\s]+(?=$)'), registration_incorrect)],
             CONTACT_CHOICE: [MessageHandler(
                 Filters.regex('^(' + loc_en.CONTACT0 + '|' + loc_ru.CONTACT0 + ')$') & ~Filters.contact, contact_type),
                          # if first button pressed proceed to typing
@@ -755,10 +812,19 @@ def main():
     dispatcher.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     dispatcher.add_handler(MessageHandler(Filters.successful_payment, successful_payment_callback))
 
+
+def insert_meals() -> None:
+    import ins_meals
+    ins_meals.insert()
+def start():
     updater.start_polling()
     updater.idle()
+def stop():
+    updater.stop()
 
 
 # run
 if __name__ == '__main__':
     main()
+    start()
+    insert_meals()
