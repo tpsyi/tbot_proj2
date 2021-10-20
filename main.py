@@ -44,9 +44,7 @@ def split_overlap(array, size, overlap):
             array = array[size - overlap:]
 
 def gen_hash_pass(password: str, s_length: int, k_length: int, i_amount: int):
-    s_length = int(s_length)
     salt = os.urandom(s_length)
-    print(type(config.SALT_LENGTH))
     key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, i_amount, k_length)
     return salt+key
 
@@ -818,7 +816,6 @@ def insert_meals() -> None:
     ins_meals.insert()
 def start():
     updater.start_polling()
-    updater.idle()
 def stop():
     updater.stop()
 
