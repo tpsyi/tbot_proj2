@@ -482,7 +482,7 @@ def def_cart(update: Update, context: CallbackContext):
                      title=lang.PAYMENT0,
                      description=lang.PAYMENT01,
                      payload=payload,
-                     prices=[LabeledPrice("Order", int(r_t_cost) * config.CUR_DEC)],
+                     prices=[LabeledPrice("Order", int(r_t_cost) * 100)],
                      currency=config.CURRENCY,
                      provider_token=config.PAYMENT_TOKEN)
     reply_keyboard = [[lang.MAIN0, lang.MAIN1], [lang.MAIN2]]
